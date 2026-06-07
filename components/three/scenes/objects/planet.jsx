@@ -1,17 +1,19 @@
 import * as THREE from 'three';
-import { useFrame } from '@react-three/fiber';
+import { useFrame, useThree } from '@react-three/fiber';
 import { useRef } from 'react';
 import QuadSphere from '../primitives/quadSphere';
 import { buildFaceGeometry } from '../primitives/quadSphere';
 import Line from '../primitives/line';
 
-const Planet = ({ sphereAmount }) => {
-    const geomRef = useRef(new QuadSphere(20, 32, sphereAmount));
-    const faceGeom = useRef(buildFaceGeometry(new THREE.Vector3(0, 1, 0), 32, 20, sphereAmount));
+const Planet = () => {
+    const { camera } = useThree();
+    const quadSphere = useRef(new QuadSphere({ dists: [20, 10, 5, 2, 1], detail: [50, 2, 2, 3, 2] }, 20, 1));
+    const meshRef = useRef();
 
     useFrame(() => {
-        if(geomRef.current){
-            geomRef.current.updateSphereAmount(sphereAmount);
+        if(quadSphere.current && meshRef.current){
+            meshRef.current.updateMatrixWorld();
+            quadSphere.current.update(camera, meshRef.current.matrixWorld);
         }
     })
 
@@ -19,11 +21,10 @@ const Planet = ({ sphereAmount }) => {
         <>
             <Line position={[0, 20, 0]} direction={[1, 0, 0]} length={100} color="red" />
             <Line position={[0, 20, 0]} direction={new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(1, 0, 0))} length={100} color="red" />
-            <mesh geometry={faceGeom.current}>
+            <mesh ref={meshRef} geometry={quadSphere.current.geometry}>
                 <meshStandardMaterial color={'white'} wireframe={true} />
             </mesh>
         </>
-
     )
 }
 
