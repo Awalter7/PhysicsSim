@@ -360,7 +360,7 @@ class QuadNode {
     this.radius = radius;
     this.lodSteps = lodSteps;
     this.depth = depth;
-    this.maxDepth = lodSteps.dists.length;
+    this.maxDepth = Math.min(lodSteps.dists.length, lodSteps.detail.length - 1);
     this.sphereAmount = sphereAmount;
     this.noiseParams = noiseParams;
 
@@ -509,7 +509,7 @@ class QuadTree {
     this.faceNormal = faceNormal;
     this.radius = radius;
     this.lodSteps = lodSteps;
-    this.maxDepth = lodSteps.dists.length;
+    this.maxDepth = Math.min(lodSteps.dists.length, lodSteps.detail.length - 1);
 
     const tangentA = new THREE.Vector3(faceNormal.y, faceNormal.z, faceNormal.x);
     const tangentB = new THREE.Vector3().crossVectors(faceNormal, tangentA);

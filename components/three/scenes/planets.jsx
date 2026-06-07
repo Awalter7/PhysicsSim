@@ -33,10 +33,9 @@ export function Planets({ className, id }) {
             ref={canvasRef} 
             shadows
             camera={{
-                position: [2, 200, 200], // ← starts at -550
-                rotation: [-3.0332631463700075, 0, -Math.PI],
+                position: [0, 0, 12756000 * 2.5],
                 near: 1,
-                far: 1.496e22,
+                far: 1.496e11,
             }}
             gl={{ antialias: true, logarithmicDepthBuffer: true }} // ← add this
             className={className}
