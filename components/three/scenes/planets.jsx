@@ -1,13 +1,15 @@
 "use client"
 import React, { useRef} from "react";
 import { Canvas} from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import Planet from "./objects/planet";
+import { AmbientLight, DirectionalLight, GridHelper } from "three";
+
 
 
 
 export function Planets({ className, id }) {
     const canvasRef = useRef(null);   // ← new ref
-
-
 
     return (
         <Canvas
@@ -29,11 +31,16 @@ export function Planets({ className, id }) {
                 width: "100vw",
                 height: "100vh",
                 zIndex: "10",
-                backgroundColor: "transparent",
-
-        }}
+                backgroundColor: "black",   
+            }}
         >
+            <ambientLight intensity={0.5} />
+            <directionalLight position={[5, 5, 5]} intensity={1} />
+            
+            <OrbitControls />
 
+            <gridHelper args={[100, 100]} position={[0, -1, 0]} />
+            <axesHelper args={[100]} position={[0, -1, 0]} />
         </Canvas>
     );
 }
