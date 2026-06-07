@@ -1,6 +1,206 @@
 import * as THREE from "three"
 import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
 
+// ── Noise ─────────────────────────────────────────────────────────────────────
+
+function smoothstep(edge0, edge1, x) {
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+function fbm(x, y, z, { octaves = 5, lacunarity = 2.0, persistence = 0.5, seed = 0 } = {}) {
+  let value = 0, amplitude = 1, frequency = 1, maxValue = 0;
+  for (let i = 0; i < octaves; i++) {
+    value    += gradientNoise(x * frequency, y * frequency, z * frequency, seed + i) * amplitude;
+    maxValue += amplitude;
+    amplitude  *= persistence;
+    frequency  *= lacunarity;
+  }
+  return value / maxValue;
+}
+
+function gradientNoise(x, y, z, seed = 0) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+  const uz = fz * fz * (3 - 2 * fz);
+
+  const hash = (a, b, c) => {
+    let n = (a + seed * 1619) * 1619 + (b + seed * 31337) * 31337 + c * 6971;
+    n = (n ^ (n >>> 13)) * 1274126177;
+    n = n ^ (n >>> 16);
+    return ((n >>> 0) / 0xffffffff) * 2 - 1;
+  };
+
+  return (
+    hash(ix,   iy,   iz  ) * (1-ux) * (1-uy) * (1-uz) +
+    hash(ix+1, iy,   iz  ) *    ux  * (1-uy) * (1-uz) +
+    hash(ix,   iy+1, iz  ) * (1-ux) *    uy  * (1-uz) +
+    hash(ix+1, iy+1, iz  ) *    ux  *    uy  * (1-uz) +
+    hash(ix,   iy,   iz+1) * (1-ux) * (1-uy) *    uz  +
+    hash(ix+1, iy,   iz+1) *    ux  * (1-uy) *    uz  +
+    hash(ix,   iy+1, iz+1) * (1-ux) *    uy  *    uz  +
+    hash(ix+1, iy+1, iz+1) *    ux  *    uy  *    uz
+  );
+}
+
+function buildRidgedTerrainFn({ seed = 0, scale = 10, amplitude = 2.7, octaves = 5, lacunarity = 2.95, gain = 0.4, warpStrength = 5.0 } = {}) {
+  function warpedNoise(px, py) {
+    const ix = Math.floor(px), iy = Math.floor(py);
+    const fx = px - ix, fy = py - iy;
+    const ux = fx * fx * (3 - 2 * fx);
+    const uy = fy * fy * (3 - 2 * fy);
+
+    const hash = (a, b) => {
+      let n = (a + seed) * 374761393 + b * 668265263;
+      n = (n ^ (n >>> 13)) * 1274126177;
+      n = n ^ (n >>> 16);
+      return ((n >>> 0) / 0xffffffff);
+    };
+
+    const a = hash(ix,   iy),   b = hash(ix+1, iy);
+    const c = hash(ix,   iy+1), d = hash(ix+1, iy+1);
+
+    return {
+      val:  a + (b-a)*ux + (c-a)*uy + (a-b-c+d)*ux*uy,
+      dfdx: 6*fx*(1-fx) * ((b-a) + (a-b-c+d)*uy),
+      dfdy: 6*fy*(1-fy) * ((c-a) + (a-b-c+d)*ux),
+    };
+  }
+
+  const rotate = (px, py) => [0.80*px - 0.60*py, 0.60*px + 0.80*py];
+
+  return function sampleTerrain(nx, ny, nz) {
+    const lon = Math.atan2(nz, nx);
+    const lat = Math.asin(Math.max(-1, Math.min(1, ny)));
+    let px = lon * scale, py = lat * scale;
+
+    let elevation = 0, octaveAmplitude = 1;
+    let amplitudeScale = Math.abs(gain);
+    let warpPower = warpStrength;
+    let gradX = 0, gradY = 0;
+
+    for (let i = 0; i < octaves; i++) {
+      const sample = warpedNoise(px, py);
+
+      gradX += Math.pow(Math.abs(sample.dfdx), warpPower);
+      gradY += Math.pow(Math.abs(sample.dfdy), warpPower);
+      warpPower = Math.max(1, warpPower - 1);
+
+      const warpDenominator = gradX*gradX + gradY*gradY + 0.85;
+      elevation += octaveAmplitude * sample.val / warpDenominator;
+
+      octaveAmplitude *= amplitudeScale;
+      amplitudeScale  *= 0.8;
+
+      [px, py] = rotate(px * lacunarity, py * lacunarity);
+    }
+
+    const normalizationFactor = smoothstep(1.5, -0.5, elevation) + 0.75;
+    return (elevation / normalizationFactor) * amplitude;
+  };
+}
+
+function buildCombinedHeightFn({
+  seed = 0,
+  radius = 1,
+  continentFrequency = 1.0,
+  continentOctaves = 5,
+  continentLacunarity = 2.0,
+  continentPersistence = 0.5,
+  plateauLevel = 0.5,
+  continentShapeExponent = 1.5,
+  continentHeightFrac = 0.01,
+  mountainHeightFrac  = 0.005,
+  oceanDepthFrac      = 0.008,
+  trenchDepthFrac     = 0.004,
+  terrainScale = 20.0,
+  terrainOctaves = 5,
+  terrainLacunarity = 2.95,
+  terrainGain = -0.4,
+  terrainWarpStrength = 5.0,
+  coastBlendWidth = 0.08,
+  seabedFrequency = 2.0,
+  seabedOctaves = 4,
+  seabedLacunarity = 2.2,
+  seabedPersistence = 0.55,
+} = {}) {
+  const ridgedTerrain = buildRidgedTerrainFn({
+    seed,
+    scale: terrainScale,
+    amplitude: 1.0,
+    octaves: terrainOctaves,
+    lacunarity: terrainLacunarity,
+    gain: terrainGain,
+    warpStrength: terrainWarpStrength,
+  });
+
+  const continentAmp = radius * continentHeightFrac;
+  const mountainAmp  = radius * mountainHeightFrac;
+  const oceanAmp     = radius * oceanDepthFrac;
+  const trenchAmp    = radius * trenchDepthFrac;
+
+  return function sampleElevation(nx, ny, nz) {
+    let continentValue = fbm(
+      nx * continentFrequency * 0.5,
+      ny * continentFrequency * 0.5,
+      nz * continentFrequency * 0.5,
+      { octaves: continentOctaves, lacunarity: continentLacunarity, persistence: continentPersistence, seed }
+    );
+    continentValue = Math.pow((continentValue + 1) * 0.5, continentShapeExponent);
+
+    if (continentValue > plateauLevel) {
+      const landBlend = (continentValue - plateauLevel) / (1.0 - plateauLevel);
+      const coastMask = smoothstep(plateauLevel, plateauLevel + coastBlendWidth, continentValue);
+      return landBlend * continentAmp + ridgedTerrain(nx, ny, nz) * coastMask * mountainAmp;
+    }
+
+    const oceanBlend = 1.0 - (continentValue / plateauLevel);
+    const oceanShape = oceanBlend * oceanBlend * (3 - 2 * oceanBlend);
+    const seabedVariation = fbm(
+      nx * seabedFrequency, ny * seabedFrequency, nz * seabedFrequency,
+      { octaves: seabedOctaves, lacunarity: seabedLacunarity, persistence: seabedPersistence, seed: seed + 1 }
+    );
+    return -oceanShape * oceanAmp + seabedVariation * trenchAmp * oceanShape;
+  };
+}
+
+export const defaultNoiseParams = {
+  seed:                  0,
+  continentFrequency:    1.0,
+  continentOctaves:      5,
+  continentLacunarity:   2.0,
+  continentPersistence:  0.5,
+  plateauLevel:          0.5,
+  continentShapeExponent:1.5,
+  continentHeightFrac:   0.01,
+  mountainHeightFrac:    0.005,
+  oceanDepthFrac:        0.05,
+  trenchDepthFrac:       0.005,
+  coastBlendWidth:       0.08,
+  terrainScale:          20.0,
+  terrainOctaves:        5,
+  terrainLacunarity:     2.95,
+  terrainGain:          -0.4,
+  terrainWarpStrength:   5.0,
+  seabedFrequency:       2.0,
+  seabedOctaves:         4,
+  seabedLacunarity:      2.2,
+  seabedPersistence:     0.55,
+};
+
+const heightFnCache = new Map();
+function getHeightFn(noiseParams, radius) {
+  const cacheKey = JSON.stringify(noiseParams) + `:${radius}`;
+  if (!heightFnCache.has(cacheKey)) {
+    heightFnCache.set(cacheKey, buildCombinedHeightFn({ ...noiseParams, radius }));
+  }
+  return heightFnCache.get(cacheKey);
+}
+
+// ── Sphere geometry helpers ───────────────────────────────────────────────────
+
 export function buildFaceGeometry(faceNormal, resolution, radius, sphereAmount = 1) {
   const tangentA = new THREE.Vector3(faceNormal.y, faceNormal.z, faceNormal.x);
   const tangentB = new THREE.Vector3().crossVectors(faceNormal, tangentA);
@@ -75,6 +275,37 @@ function cubePointToSphereDirection(faceNormal, tangentA, tangentB, faceU, faceV
   return cubePoint.lerp(cubePoint.clone().normalize(), sphereAmount);
 }
 
+function displacedSurfacePoint(sphereDirection, radius, heightFn) {
+  const elevation = heightFn(sphereDirection.x, sphereDirection.y, sphereDirection.z);
+  return sphereDirection.clone().multiplyScalar(radius + (isFinite(elevation) ? elevation : 0));
+}
+
+function computeDisplacedNormal(sphereDirection, radius, heightFn, epsilon = 0.0001) {
+  const ref = Math.abs(sphereDirection.y) < 0.9
+    ? new THREE.Vector3(0, 1, 0)
+    : new THREE.Vector3(1, 0, 0);
+
+  const tangent   = new THREE.Vector3().crossVectors(ref, sphereDirection).normalize();
+  const bitangent = new THREE.Vector3().crossVectors(sphereDirection, tangent).normalize();
+
+  const sampleNeighbour = (dt, db) => {
+    const neighbourDir = new THREE.Vector3()
+      .copy(sphereDirection)
+      .addScaledVector(tangent, dt)
+      .addScaledVector(bitangent, db)
+      .normalize();
+    return displacedSurfacePoint(neighbourDir, radius, heightFn);
+  };
+
+  const right = sampleNeighbour( epsilon, 0).sub(sampleNeighbour(-epsilon, 0));
+  const up    = sampleNeighbour(0,  epsilon).sub(sampleNeighbour(0, -epsilon));
+
+  const normal = new THREE.Vector3().crossVectors(right, up);
+  return normal.lengthSq() === 0 ? sphereDirection.clone() : normal.normalize();
+}
+
+// ── Occlusion ─────────────────────────────────────────────────────────────────
+
 function isOccludedByOccluders(targetCenter, targetRadius, cameraLocalPos, occluders) {
   if (!occluders || occluders.length === 0) return false;
 
@@ -117,8 +348,10 @@ function isOccludedByOccluders(targetCenter, targetRadius, cameraLocalPos, occlu
   return false;
 }
 
+// ── QuadNode ──────────────────────────────────────────────────────────────────
+
 class QuadNode {
-  constructor(faceNormal, tangentA, tangentB, tileOffset, tileSize, radius, lodSteps, depth, sphereAmount) {
+  constructor(faceNormal, tangentA, tangentB, tileOffset, tileSize, radius, lodSteps, depth, sphereAmount, noiseParams) {
     this.faceNormal = faceNormal;
     this.tangentA = tangentA;
     this.tangentB = tangentB;
@@ -129,6 +362,7 @@ class QuadNode {
     this.depth = depth;
     this.maxDepth = lodSteps.dists.length;
     this.sphereAmount = sphereAmount;
+    this.noiseParams = noiseParams;
 
     this.children = [];
     this.geometry = null;
@@ -145,15 +379,19 @@ class QuadNode {
     ];
     this._centerDirection = cubePointToSphereDirection(faceNormal, tangentA, tangentB, uCenter, vCenter, sphereAmount);
 
-    this.boundingSphere = new THREE.Sphere().setFromPoints(
-      this._cornerDirections.map(direction => direction.clone().multiplyScalar(radius))
-    );
+    const heightFn = getHeightFn(noiseParams, radius);
+    this.boundingSphere = new THREE.Sphere().setFromPoints([
+      ...this._cornerDirections.map(dir => displacedSurfacePoint(dir, radius, heightFn)),
+      displacedSurfacePoint(this._centerDirection, radius, heightFn),
+    ]);
 
     this._tileSurfaceCenter = this._centerDirection.clone().multiplyScalar(radius);
   }
 
   _buildLeafGeometry() {
-    const { faceNormal, tangentA, tangentB, tileOffset, tileSize, radius, sphereAmount } = this;
+    const { faceNormal, tangentA, tangentB, tileOffset, tileSize, radius, sphereAmount, noiseParams } = this;
+    const heightFn = getHeightFn(noiseParams, radius);
+
     const uMin = tileOffset.x, vMin = tileOffset.y;
     const uMax = tileOffset.x + tileSize, vMax = tileOffset.y + tileSize;
 
@@ -162,16 +400,18 @@ class QuadNode {
     const normals   = new Float32Array(4 * 3);
 
     cornerUVs.forEach(([u, v], i) => {
-      const direction = cubePointToSphereDirection(faceNormal, tangentA, tangentB, u, v, sphereAmount);
-      const vertexNormal = direction.clone().normalize();
+      const sphereDir = cubePointToSphereDirection(faceNormal, tangentA, tangentB, u, v, sphereAmount);
+      const elevation = heightFn(sphereDir.x, sphereDir.y, sphereDir.z);
+      const surfacePoint = sphereDir.clone().multiplyScalar(radius + (isFinite(elevation) ? elevation : 0));
+      const surfaceNormal = computeDisplacedNormal(sphereDir, radius, heightFn);
 
-      positions[i * 3 + 0] = direction.x * radius;
-      positions[i * 3 + 1] = direction.y * radius;
-      positions[i * 3 + 2] = direction.z * radius;
+      positions[i * 3 + 0] = surfacePoint.x;
+      positions[i * 3 + 1] = surfacePoint.y;
+      positions[i * 3 + 2] = surfacePoint.z;
 
-      normals[i * 3 + 0] = vertexNormal.x;
-      normals[i * 3 + 1] = vertexNormal.y;
-      normals[i * 3 + 2] = vertexNormal.z;
+      normals[i * 3 + 0] = surfaceNormal.x;
+      normals[i * 3 + 1] = surfaceNormal.y;
+      normals[i * 3 + 2] = surfaceNormal.z;
     });
 
     this.geometry = new THREE.BufferGeometry();
@@ -194,7 +434,8 @@ class QuadNode {
         this.children.push(new QuadNode(
           this.faceNormal, this.tangentA, this.tangentB,
           new THREE.Vector2(this.tileOffset.x + col * childTileSize, this.tileOffset.y + row * childTileSize),
-          childTileSize, this.radius, this.lodSteps, childDepth, this.sphereAmount,
+          childTileSize, this.radius, this.lodSteps, childDepth,
+          this.sphereAmount, this.noiseParams,
         ));
       }
     }
@@ -218,8 +459,10 @@ class QuadNode {
   }
 }
 
+// ── QuadTree ──────────────────────────────────────────────────────────────────
+
 class QuadTree {
-  constructor(faceNormal, radius, lodSteps, sphereAmount) {
+  constructor(faceNormal, radius, lodSteps, sphereAmount, noiseParams) {
     this.faceNormal = faceNormal;
     this.radius = radius;
     this.lodSteps = lodSteps;
@@ -228,10 +471,10 @@ class QuadTree {
     const tangentA = new THREE.Vector3(faceNormal.y, faceNormal.z, faceNormal.x);
     const tangentB = new THREE.Vector3().crossVectors(faceNormal, tangentA);
 
-    this._rootNodes = this._buildRootNodes(faceNormal, tangentA, tangentB, radius, lodSteps, sphereAmount);
+    this._rootNodes = this._buildRootNodes(faceNormal, tangentA, tangentB, radius, lodSteps, sphereAmount, noiseParams);
   }
 
-  _buildRootNodes(faceNormal, tangentA, tangentB, radius, lodSteps, sphereAmount) {
+  _buildRootNodes(faceNormal, tangentA, tangentB, radius, lodSteps, sphereAmount, noiseParams) {
     const rootGridSize = lodSteps.detail[0];
     const rootTileSize = 1.0 / rootGridSize;
     const rootNodes = [];
@@ -241,7 +484,8 @@ class QuadTree {
         const node = new QuadNode(
           faceNormal, tangentA, tangentB,
           new THREE.Vector2(col * rootTileSize, row * rootTileSize),
-          rootTileSize, radius, lodSteps, 0, sphereAmount,
+          rootTileSize, radius, lodSteps, 0,
+          sphereAmount, noiseParams,
         );
         node._buildLeafGeometry();
         rootNodes.push(node);
@@ -302,15 +546,19 @@ class QuadTree {
   }
 }
 
+// ── QuadSphere ────────────────────────────────────────────────────────────────
+
 export default class QuadSphere {
   constructor(
     lodSteps = { dists: [2000000, 20000, 1000, 100], detail: [25, 50, 75, 100] },
     radius = 1,
     sphereAmount = 1,
+    noiseParams = defaultNoiseParams,
   ) {
     this.lodSteps = lodSteps;
     this.radius = radius;
     this.sphereAmount = sphereAmount;
+    this.noiseParams = { ...defaultNoiseParams, ...noiseParams };
 
     this.geometry = new THREE.BufferGeometry();
     this.occluders = [];
@@ -327,7 +575,9 @@ export default class QuadSphere {
       new THREE.Vector3( 0,  0, -1),
     ];
 
-    this.quadTrees = faceNormals.map(faceNormal => new QuadTree(faceNormal, radius, lodSteps, sphereAmount));
+    this.quadTrees = faceNormals.map(faceNormal =>
+      new QuadTree(faceNormal, radius, lodSteps, sphereAmount, this.noiseParams)
+    );
 
     this._frustum = new THREE.Frustum();
     this._cameraProjectionMatrix = new THREE.Matrix4();
@@ -424,6 +674,27 @@ export default class QuadSphere {
     );
 
     this.geometry.computeBoundsTree?.();
+  }
+
+  rebuildWithParams(noiseParams) {
+    this.noiseParams = { ...defaultNoiseParams, ...noiseParams };
+
+    for (const quadTree of this.quadTrees) quadTree.dispose();
+
+    const faceNormals = [
+      new THREE.Vector3( 0,  1,  0),
+      new THREE.Vector3( 0, -1,  0),
+      new THREE.Vector3(-1,  0,  0),
+      new THREE.Vector3( 1,  0,  0),
+      new THREE.Vector3( 0,  0,  1),
+      new THREE.Vector3( 0,  0, -1),
+    ];
+
+    this.quadTrees = faceNormals.map(faceNormal =>
+      new QuadTree(faceNormal, this.radius, this.lodSteps, this.sphereAmount, this.noiseParams)
+    );
+
+    this._rebuildGeometry();
   }
 
   dispose() {
