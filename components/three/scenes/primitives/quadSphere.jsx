@@ -388,40 +388,82 @@ class QuadNode {
     this._tileSurfaceCenter = this._centerDirection.clone().multiplyScalar(radius);
   }
 
-  _buildLeafGeometry() {
+  // topDiv/rightDiv/bottomDiv/leftDiv: segment count on each edge.
+  // 1 = no extra vertices; N = N-1 interior vertices added to match finer neighbours.
+  _buildGeometry(topDiv, rightDiv, bottomDiv, leftDiv) {
     const { faceNormal, tangentA, tangentB, tileOffset, tileSize, radius, sphereAmount, noiseParams } = this;
     const heightFn = getHeightFn(noiseParams, radius);
 
     const uMin = tileOffset.x, vMin = tileOffset.y;
-    const uMax = tileOffset.x + tileSize, vMax = tileOffset.y + tileSize;
+    const uMax = uMin + tileSize, vMax = vMin + tileSize;
 
-    const cornerUVs = [[uMin, vMin], [uMax, vMin], [uMin, vMax], [uMax, vMax]];
-    const positions = new Float32Array(4 * 3);
-    const normals   = new Float32Array(4 * 3);
+    // Vertex order: 4 corners, then edge interiors, then one centre vertex.
+    const uvCoords = [
+      [uMin, vMin], // 0 TL
+      [uMax, vMin], // 1 TR
+      [uMin, vMax], // 2 BL
+      [uMax, vMax], // 3 BR
+    ];
 
-    cornerUVs.forEach(([u, v], i) => {
-      const sphereDir = cubePointToSphereDirection(faceNormal, tangentA, tangentB, u, v, sphereAmount);
-      const elevation = heightFn(sphereDir.x, sphereDir.y, sphereDir.z);
+    const topIntBase    = uvCoords.length;
+    for (let k = 1; k < topDiv;    k++) uvCoords.push([uMin + k * tileSize / topDiv,    vMin]);
+    const rightIntBase  = uvCoords.length;
+    for (let k = 1; k < rightDiv;  k++) uvCoords.push([uMax, vMin + k * tileSize / rightDiv]);
+    const bottomIntBase = uvCoords.length;
+    for (let k = 1; k < bottomDiv; k++) uvCoords.push([uMin + k * tileSize / bottomDiv, vMax]);
+    const leftIntBase   = uvCoords.length;
+    for (let k = 1; k < leftDiv;   k++) uvCoords.push([uMin, vMin + k * tileSize / leftDiv]);
+    const centerIdx     = uvCoords.length;
+    uvCoords.push([(uMin + uMax) * 0.5, (vMin + vMax) * 0.5]);
+
+    const n         = uvCoords.length;
+    const positions = new Float32Array(n * 3);
+    const normals   = new Float32Array(n * 3);
+
+    for (let i = 0; i < n; i++) {
+      const [u, v]   = uvCoords[i];
+      const sphereDir    = cubePointToSphereDirection(faceNormal, tangentA, tangentB, u, v, sphereAmount);
+      const elevation    = heightFn(sphereDir.x, sphereDir.y, sphereDir.z);
       const surfacePoint = sphereDir.clone().multiplyScalar(radius + (isFinite(elevation) ? elevation : 0));
-      const surfaceNormal = computeDisplacedNormal(sphereDir, radius, heightFn);
+      const surfaceNorm  = computeDisplacedNormal(sphereDir, radius, heightFn);
 
-      positions[i * 3 + 0] = surfacePoint.x;
+      positions[i * 3]     = surfacePoint.x;
       positions[i * 3 + 1] = surfacePoint.y;
       positions[i * 3 + 2] = surfacePoint.z;
+      normals  [i * 3]     = surfaceNorm.x;
+      normals  [i * 3 + 1] = surfaceNorm.y;
+      normals  [i * 3 + 2] = surfaceNorm.z;
+    }
 
-      normals[i * 3 + 0] = surfaceNormal.x;
-      normals[i * 3 + 1] = surfaceNormal.y;
-      normals[i * 3 + 2] = surfaceNormal.z;
-    });
+    // Perimeter in CW UV order → outward-facing triangles on the sphere.
+    const perimeter = [0]; // TL
+    for (let k = 0; k < topDiv    - 1; k++) perimeter.push(topIntBase    + k);
+    perimeter.push(1); // TR
+    for (let k = 0; k < rightDiv  - 1; k++) perimeter.push(rightIntBase  + k);
+    perimeter.push(3); // BR
+    for (let k = bottomDiv - 2; k >= 0; k--) perimeter.push(bottomIntBase + k); // right→left
+    perimeter.push(2); // BL
+    for (let k = leftDiv   - 2; k >= 0; k--) perimeter.push(leftIntBase   + k); // bottom→top
+
+    const indexList = [];
+    for (let i = 0; i < perimeter.length; i++) {
+      indexList.push(centerIdx, perimeter[i], perimeter[(i + 1) % perimeter.length]);
+    }
 
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    this.geometry.setAttribute('normal',   new THREE.Float32BufferAttribute(normals, 3));
-    this.geometry.setIndex(new THREE.BufferAttribute(new Uint32Array([0, 3, 2, 0, 1, 3]), 1));
+    this.geometry.setAttribute('normal',   new THREE.Float32BufferAttribute(normals,   3));
+    this.geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(indexList), 1));
   }
 
-  _ensureLeafGeometry() {
-    if (!this.geometry) this._buildLeafGeometry();
+  // Called by the QuadTree stitching pass; rebuilds only when subdivisions change.
+  applyStitching(topDiv, rightDiv, bottomDiv, leftDiv) {
+    const d = this._edgeDivisions;
+    const unchanged = d && d[0] === topDiv && d[1] === rightDiv && d[2] === bottomDiv && d[3] === leftDiv;
+    if (unchanged && this.geometry) return; // geometry already up to date
+    if (this.geometry) { this.geometry.dispose(); this.geometry = null; }
+    this._edgeDivisions = [topDiv, rightDiv, bottomDiv, leftDiv];
+    this._buildGeometry(topDiv, rightDiv, bottomDiv, leftDiv);
   }
 
   splitIntoChildren() {
@@ -449,6 +491,7 @@ class QuadNode {
   cullSelf() {
     this.mergeChildren();
     if (this.geometry) { this.geometry.dispose(); this.geometry = null; }
+    this._frameVisible = -1;
   }
 
   hasChildren() { return this.children.length > 0; }
@@ -487,7 +530,6 @@ class QuadTree {
           rootTileSize, radius, lodSteps, 0,
           sphereAmount, noiseParams,
         );
-        node._buildLeafGeometry();
         rootNodes.push(node);
       }
     }
@@ -495,6 +537,17 @@ class QuadTree {
   }
 
   _updateNode(node, cameraLocalPos, frustum, cullContext) {
+    // Self-occlusion: cull nodes whose tile center is entirely behind the planet horizon.
+    // horizonCos = radius / camDist is the cosine of the angle to the geometric horizon.
+    // Subtract a margin based on the node's bounding sphere so limb tiles are never clipped.
+    if (cullContext.horizonCos > 0) {
+      const margin = node.boundingSphere.radius / cullContext.camDist;
+      if (node._centerDirection.dot(cullContext.camDir) < cullContext.horizonCos - margin) {
+        node.cullSelf();
+        return;
+      }
+    }
+
     let shouldSplit = false;
     if (node.depth < this.maxDepth) {
       const distanceToCamera = cameraLocalPos.distanceTo(node.boundingSphere.center);
@@ -503,6 +556,7 @@ class QuadTree {
     }
 
     if (shouldSplit) {
+      node._frameVisible = -1;
       if (!node.hasChildren()) node.splitIntoChildren();
       if (node.geometry) { node.geometry.dispose(); node.geometry = null; }
       for (const child of node.children) this._updateNode(child, cameraLocalPos, frustum, cullContext);
@@ -513,18 +567,79 @@ class QuadTree {
 
     if (!frustum.intersectsSphere(node.boundingSphere)) { node.cullSelf(); return; }
 
-    if (cullContext?.occluders?.length > 0) {
-      if (isOccludedByOccluders(node.boundingSphere.center, node.boundingSphere.radius, cullContext.cameraLocalPos, cullContext.occluders)) {
-        node.cullSelf();
-        return;
-      }
-    }
-
-    node._ensureLeafGeometry();
+    node._frameVisible = this._frameCounter;
   }
 
   update(cameraLocalPos, frustum, cullContext) {
+    this._frameCounter = (this._frameCounter || 0) + 1;
     for (const rootNode of this._rootNodes) this._updateNode(rootNode, cameraLocalPos, frustum, cullContext);
+    this._stitchBoundaries();
+  }
+
+  _findLeafAtUV(u, v) {
+    if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+    const gridSize = this.lodSteps.detail[0];
+    const rootTileSize = 1.0 / gridSize;
+    const col = Math.min(gridSize - 1, Math.floor(u / rootTileSize));
+    const row = Math.min(gridSize - 1, Math.floor(v / rootTileSize));
+    return this._findLeafInSubtree(this._rootNodes[row * gridSize + col], u, v);
+  }
+
+  _findLeafInSubtree(node, u, v) {
+    if (!node || !node.hasChildren()) return node || null;
+    for (const child of node.children) {
+      const { x: cu, y: cv } = child.tileOffset;
+      if (u >= cu && u < cu + child.tileSize && v >= cv && v < cv + child.tileSize) {
+        return this._findLeafInSubtree(child, u, v);
+      }
+    }
+    return node;
+  }
+
+  _edgeDivisionsForNode(node, edgeCoord, varMin, varMax, isVertical) {
+    // Sample at the midpoint of each sub-segment for the next LOD level.
+    // Sampling into an already-split child returns the finest leaf, so multi-level
+    // transitions are detected automatically.
+    const nextDetail = this.lodSteps.detail[node.depth + 1] || 1;
+    const step = (varMax - varMin) / nextDetail;
+    let maxDiv = 1;
+    for (let k = 0; k < nextDetail; k++) {
+      const t = varMin + (k + 0.5) * step;
+      const [u, v] = isVertical ? [edgeCoord, t] : [t, edgeCoord];
+      const neighbor = this._findLeafAtUV(u, v);
+      if (neighbor && neighbor._frameVisible === this._frameCounter && neighbor.tileSize < node.tileSize - 1e-10) {
+        const ratio = node.tileSize / neighbor.tileSize;
+        if (ratio > 1 && ratio < 64) maxDiv = Math.max(maxDiv, Math.round(ratio));
+      }
+    }
+    return maxDiv;
+  }
+
+  _collectVisibleLeaves(node, result) {
+    if (!node.hasChildren()) {
+      if (node._frameVisible === this._frameCounter) result.push(node);
+      return;
+    }
+    for (const child of node.children) this._collectVisibleLeaves(child, result);
+  }
+
+  _stitchBoundaries() {
+    const visibleLeaves = [];
+    for (const root of this._rootNodes) this._collectVisibleLeaves(root, visibleLeaves);
+
+    for (const node of visibleLeaves) {
+      const { tileOffset, tileSize } = node;
+      const uMin = tileOffset.x, vMin = tileOffset.y;
+      const uMax = uMin + tileSize, vMax = vMin + tileSize;
+      const eps  = tileSize * 0.0001;
+
+      const topDiv    = this._edgeDivisionsForNode(node, vMin - eps, uMin, uMax, false);
+      const bottomDiv = this._edgeDivisionsForNode(node, vMax + eps, uMin, uMax, false);
+      const leftDiv   = this._edgeDivisionsForNode(node, uMin - eps, vMin, vMax, true);
+      const rightDiv  = this._edgeDivisionsForNode(node, uMax + eps, vMin, vMax, true);
+
+      node.applyStitching(topDiv, rightDiv, bottomDiv, leftDiv);
+    }
   }
 
   _collectLeafGeometries(node, result) {
@@ -649,7 +764,12 @@ export default class QuadSphere {
       }
     }
 
-    const cullContext = { cameraLocalPos, occluders: frameOccluders };
+    const camDist = cameraLocalPos.length();
+    const camDir  = cameraLocalPos.clone().normalize();
+    // horizonCos: cos of the angle to the geometric horizon; 0 when camera is inside the sphere
+    const horizonCos = camDist > this.radius ? this.radius / camDist : 0;
+
+    const cullContext = { cameraLocalPos, occluders: frameOccluders, camDir, camDist, horizonCos };
 
     for (const quadTree of this.quadTrees) quadTree.update(cameraLocalPos, this._frustum, cullContext);
     this._rebuildGeometry();
