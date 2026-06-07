@@ -3,13 +3,30 @@ import React, { useRef} from "react";
 import { Canvas} from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import Planet from "./objects/planet";
-import { AmbientLight, DirectionalLight, GridHelper } from "three";
-
+import { useControls, folder } from 'leva';
 
 
 
 export function Planets({ className, id }) {
     const canvasRef = useRef(null);   // ← new ref
+
+    const controls = useControls({
+        Helpers: folder(
+            {
+                showGrid: { value: true, label: 'Show Grid' }, 
+                showAxes: { value: true, label: 'Show Axes' },
+            },
+            { collapsed: true }
+        ),
+        CubeToSphereDemo: folder(
+            {
+                sphereAmount: { value: 0, min: 0, max: 1, step: 0.01, label: 'Sphere Amount' },
+                showSphere: { value: true, label: 'Show Sphere' },
+            },
+            { collapsed: true }
+        ),
+    })
+
 
     return (
         <Canvas
@@ -34,13 +51,15 @@ export function Planets({ className, id }) {
                 backgroundColor: "black",   
             }}
         >
-            <primitive object={new Planet()} />
+            <Planet sphereAmount={controls.sphereAmount} />
             
             <ambientLight intensity={0.5} />
             <directionalLight position={[5, 5, 5]} intensity={1} />
+
             <OrbitControls />
-            <gridHelper args={[100, 100]} position={[0, -1, 0]} />
-            <axesHelper args={[100]} position={[0, -1, 0]} />
+
+            {controls.showGrid && <gridHelper args={[100, 100]} position={[0, -1, 0]} />}
+            {controls.showAxes && <axesHelper args={[100]} position={[0, -1, 0]} />}
         </Canvas>
     );
 }
