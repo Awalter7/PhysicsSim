@@ -14,7 +14,6 @@ export function Planets({ className, id }) {
             ref={canvasRef} 
             shadows
             camera={{
-                fov: cameraControls.fov,
                 position: [2, 200, 200], // ← starts at -550
                 rotation: [-3.0332631463700075, 0, -Math.PI],
                 near: 1,

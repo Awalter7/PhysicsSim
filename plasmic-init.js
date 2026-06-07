@@ -1,13 +1,6 @@
 // plasmic-init.js
 import { initPlasmicLoader } from "@plasmicapp/loader-nextjs";
-import { Planets } from "./components/three/scenes/planets"
-;
-
-// import { StickerPeel } from "./components/effects/StickerPeel";
-// import ThreeCanvas from "./components/three/canvas/ThreeCanvas"
-// import MapTilerMap from "./components/maps/map"
-
-import dynamic from 'next/dynamic';
+import { Planets } from "./components/three/scenes/planets";
 
 export const PLASMIC = initPlasmicLoader({
   projects: [
