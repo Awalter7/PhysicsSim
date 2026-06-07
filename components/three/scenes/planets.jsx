@@ -34,11 +34,11 @@ export function Planets({ className, id }) {
                 backgroundColor: "black",   
             }}
         >
+            <primitive object={new Planet()} />
+            
             <ambientLight intensity={0.5} />
             <directionalLight position={[5, 5, 5]} intensity={1} />
-            
             <OrbitControls />
-
             <gridHelper args={[100, 100]} position={[0, -1, 0]} />
             <axesHelper args={[100]} position={[0, -1, 0]} />
         </Canvas>
