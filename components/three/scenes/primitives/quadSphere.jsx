@@ -102,30 +102,91 @@ function buildRidgedTerrainFn({ seed = 0, scale = 10, amplitude = 2.7, octaves =
   };
 }
 
-function buildCombinedHeightFn({
+// ── Plate tectonics ──────────────────────────────────────────────────────────
+// Large-scale terrain is driven by a set of rigid "plates" (a Voronoi diagram
+// over points on the sphere). Each plate rotates as a rigid body, so its
+// surface velocity at any point is omega × point (a real rigid-rotation
+// model). Where two plates meet, their relative velocity across the boundary
+// determines whether it's convergent (collision -> mountains/trenches),
+// divergent (rifting -> mid-ocean ridges/rift valleys), or transform
+// (sliding past -> minor crumpling).
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function buildPlates(seed, plateCount, continentalFraction) {
+  const rand = mulberry32(seed * 9781 + 17);
+  const plates = [];
+  for (let i = 0; i < plateCount; i++) {
+    // Uniform random point on the unit sphere.
+    const u = rand() * 2 - 1;
+    const theta = rand() * Math.PI * 2;
+    const ringR = Math.sqrt(1 - u * u);
+    const center = new THREE.Vector3(ringR * Math.cos(theta), u, ringR * Math.sin(theta));
+
+    // Rigid-body rotation axis/speed for this plate.
+    const omega = new THREE.Vector3(rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1)
+      .normalize()
+      .multiplyScalar(0.3 + rand() * 0.7);
+
+    plates.push({ center, omega, isContinental: rand() < continentalFraction });
+  }
+  return plates;
+}
+
+// Finds the nearest and second-nearest plate centres to `dir` (unit vector).
+// `gap` is the cosine-similarity gap between them: 0 exactly on the plate
+// boundary, growing toward plate interiors.
+function findNearestPlates(plates, dir) {
+  let bestDot = -2, secondDot = -2, bestIdx = 0, secondIdx = 0;
+  for (let i = 0; i < plates.length; i++) {
+    const d = dir.dot(plates[i].center);
+    if (d > bestDot) { secondDot = bestDot; secondIdx = bestIdx; bestDot = d; bestIdx = i; }
+    else if (d > secondDot) { secondDot = d; secondIdx = i; }
+  }
+  return { A: plates[bestIdx], B: plates[secondIdx], gap: bestDot - secondDot };
+}
+
+const _toB         = new THREE.Vector3();
+const _boundaryDir = new THREE.Vector3();
+const _deltaOmega  = new THREE.Vector3();
+const _relVel      = new THREE.Vector3();
+const _dir         = new THREE.Vector3();
+
+function buildPlateHeightFn({
   seed = 0,
   radius = 1,
-  continentFrequency = 1.0,
-  continentOctaves = 5,
-  continentLacunarity = 2.0,
-  continentPersistence = 0.5,
-  plateauLevel = 0.5,
-  continentShapeExponent = 1.5,
+  plateCount = 12,
+  continentalFraction = 0.45,
   continentHeightFrac = 0.01,
-  mountainHeightFrac  = 0.005,
-  oceanDepthFrac      = 0.008,
-  trenchDepthFrac     = 0.004,
+  continentVariationFrac = 0.003,
+  oceanFloorFrac = 0.04,
+  oceanVariationFrac = 0.004,
+  mountainHeightFrac = 0.015,
+  trenchDepthFrac = 0.01,
+  ridgeHeightFrac = 0.004,
+  riftDepthFrac = 0.0025,
+  boundaryWidth = 0.02,
+  convergentThreshold = 0.15,
+  seamountHeightFrac = 0.006,
+  seamountFrequency = 6.0,
+  seamountSharpness = 6.0,
   terrainScale = 20.0,
   terrainOctaves = 5,
   terrainLacunarity = 2.95,
   terrainGain = -0.4,
   terrainWarpStrength = 5.0,
-  coastBlendWidth = 0.08,
-  seabedFrequency = 2.0,
-  seabedOctaves = 4,
-  seabedLacunarity = 2.2,
-  seabedPersistence = 0.55,
+  fineDetailFrac = 0.0008,
 } = {}) {
+  const plates = buildPlates(seed, plateCount, continentalFraction);
+
   const ridgedTerrain = buildRidgedTerrainFn({
     seed,
     scale: terrainScale,
@@ -136,65 +197,143 @@ function buildCombinedHeightFn({
     warpStrength: terrainWarpStrength,
   });
 
-  const continentAmp = radius * continentHeightFrac;
-  const mountainAmp  = radius * mountainHeightFrac;
-  const oceanAmp     = radius * oceanDepthFrac;
-  const trenchAmp    = radius * trenchDepthFrac;
+  const continentAmp  = radius * continentHeightFrac;
+  const contVarAmp    = radius * continentVariationFrac;
+  const oceanFloorAmp = radius * oceanFloorFrac;
+  const oceanVarAmp   = radius * oceanVariationFrac;
+  const mountainAmp   = radius * mountainHeightFrac;
+  const trenchAmp     = radius * trenchDepthFrac;
+  const ridgeAmp      = radius * ridgeHeightFrac;
+  const riftAmp       = radius * riftDepthFrac;
+  const seamountAmp   = radius * seamountHeightFrac;
+  const fineAmp       = radius * fineDetailFrac;
 
   return function sampleElevation(nx, ny, nz) {
-    let continentValue = fbm(
-      nx * continentFrequency * 0.5,
-      ny * continentFrequency * 0.5,
-      nz * continentFrequency * 0.5,
-      { octaves: continentOctaves, lacunarity: continentLacunarity, persistence: continentPersistence, seed }
-    );
-    continentValue = Math.pow((continentValue + 1) * 0.5, continentShapeExponent);
+    _dir.set(nx, ny, nz);
 
-    if (continentValue > plateauLevel) {
-      const landBlend = (continentValue - plateauLevel) / (1.0 - plateauLevel);
-      const coastMask = smoothstep(plateauLevel, plateauLevel + coastBlendWidth, continentValue);
-      return landBlend * continentAmp + ridgedTerrain(nx, ny, nz) * coastMask * mountainAmp;
+    const { A, B, gap } = findNearestPlates(plates, _dir);
+
+    // Plate-interior elevation: a base plateau per plate type, with
+    // low-frequency fbm so interiors aren't perfectly flat.
+    const baseNoise = fbm(nx * 1.5, ny * 1.5, nz * 1.5, { octaves: 4, lacunarity: 2.0, persistence: 0.5, seed });
+    let elevation = A.isContinental
+      ? continentAmp + baseNoise * contVarAmp
+      : -oceanFloorAmp + baseNoise * oceanVarAmp;
+
+    // Bounded, smooth falloffs from the boundary (gap === 0 on the boundary
+    // itself). Using smoothstep (rather than an unbounded exp) means each
+    // feature has a finite footprint with no infinite-gradient edges, which
+    // keeps the displaced mesh from tearing into spikes.
+    const wideFactor = 1 - smoothstep(0, boundaryWidth * 4, gap);
+
+    if (wideFactor > 0.001) {
+      // Boundary tangent direction at this point, pointing roughly from A's
+      // plate centre toward B's.
+      _toB.copy(B.center).sub(A.center);
+      _boundaryDir.copy(_dir).multiplyScalar(-_toB.dot(_dir)).add(_toB);
+      if (_boundaryDir.lengthSq() < 1e-10) _boundaryDir.set(1, 0, 0);
+      _boundaryDir.normalize();
+
+      // Relative drift of plate A vs plate B at this point (rigid rotation:
+      // velocity = omega × point), projected onto the boundary normal.
+      // Positive = plates colliding (convergent), negative = pulling apart
+      // (divergent), near zero = sliding past (transform).
+      _deltaOmega.copy(A.omega).sub(B.omega);
+      _relVel.crossVectors(_deltaOmega, _dir);
+      const convergence = -_relVel.dot(_boundaryDir);
+
+      const bothOceanic     = !A.isContinental && !B.isContinental;
+      const bothContinental =  A.isContinental &&  B.isContinental;
+      const localFactor     = 1 - smoothstep(0, boundaryWidth, gap);
+
+      let boundaryElev = 0;
+
+      if (convergence > convergentThreshold) {
+        const strength = smoothstep(convergentThreshold, convergentThreshold + 0.3, convergence);
+        const ridge = Math.max(0, ridgedTerrain(nx, ny, nz));
+
+        if (bothContinental) {
+          // Continental collision: broad mountain belt (Himalaya-style).
+          boundaryElev = mountainAmp * strength * (0.5 + 0.5 * ridge) * wideFactor;
+        } else if (bothOceanic) {
+          // Subduction trench, with a volcanic island-arc ridge set back
+          // from the trench on the overriding plate's side.
+          const trench = -trenchAmp * strength * localFactor;
+          const arcGap = Math.abs(gap - boundaryWidth * 2.0);
+          const arcInfluence = Math.exp(-(arcGap * arcGap) / (boundaryWidth * boundaryWidth));
+          boundaryElev = trench + mountainAmp * 0.6 * arcInfluence * strength * ridge;
+        } else {
+          // Oceanic-continental subduction: trench on the oceanic plate,
+          // coastal mountain range (Andes-style) on the continental plate.
+          boundaryElev = A.isContinental
+            ? mountainAmp * strength * (0.4 + 0.6 * ridge) * wideFactor
+            : -trenchAmp * strength * localFactor;
+        }
+      } else if (convergence < -convergentThreshold) {
+        const strength = smoothstep(-convergentThreshold, -convergentThreshold - 0.3, convergence);
+
+        // Continental rift valley, or a mid-ocean ridge (also forms when a
+        // continent rifts toward ocean).
+        boundaryElev = (bothContinental ? -riftAmp : ridgeAmp) * strength * localFactor;
+      } else {
+        // Transform fault: minor crumpling, no large-scale uplift/subsidence.
+        const ridge = Math.max(0, ridgedTerrain(nx, ny, nz));
+        boundaryElev = mountainAmp * 0.1 * ridge * wideFactor;
+      }
+
+      elevation += boundaryElev;
     }
 
-    const oceanBlend = 1.0 - (continentValue / plateauLevel);
-    const oceanShape = oceanBlend * oceanBlend * (3 - 2 * oceanBlend);
-    const seabedVariation = fbm(
-      nx * seabedFrequency, ny * seabedFrequency, nz * seabedFrequency,
-      { octaves: seabedOctaves, lacunarity: seabedLacunarity, persistence: seabedPersistence, seed: seed + 1 }
-    );
-    return -oceanShape * oceanAmp + seabedVariation * trenchAmp * oceanShape;
+    // Scattered seamounts / volcanic islands across oceanic plate interiors.
+    if (!A.isContinental) {
+      const seamountNoise = fbm(
+        nx * seamountFrequency, ny * seamountFrequency, nz * seamountFrequency,
+        { octaves: 3, lacunarity: 2.3, persistence: 0.5, seed: seed + 101 }
+      );
+      const spike = Math.pow(Math.max(0, seamountNoise), seamountSharpness);
+      elevation += spike * seamountAmp * (1 - wideFactor);
+    }
+
+    // Fine surface texture everywhere.
+    elevation += ridgedTerrain(nx, ny, nz) * fineAmp;
+
+    return elevation;
   };
 }
 
+// Amplitude fractions are tuned to roughly mirror real-Earth proportions
+// (radius ~6371km): continents/sea floor a few km, mountains/trenches up to
+// ~10km, mid-ocean ridges/rifts a few km, fine detail well under 1km.
 export const defaultNoiseParams = {
-  seed:                  0,
-  continentFrequency:    1.0,
-  continentOctaves:      5,
-  continentLacunarity:   2.0,
-  continentPersistence:  0.5,
-  plateauLevel:          0.5,
-  continentShapeExponent:1.5,
-  continentHeightFrac:   0.01,
-  mountainHeightFrac:    0.005,
-  oceanDepthFrac:        0.05,
-  trenchDepthFrac:       0.005,
-  coastBlendWidth:       0.08,
-  terrainScale:          20.0,
-  terrainOctaves:        5,
-  terrainLacunarity:     2.95,
-  terrainGain:          -0.4,
-  terrainWarpStrength:   5.0,
-  seabedFrequency:       2.0,
-  seabedOctaves:         4,
-  seabedLacunarity:      2.2,
-  seabedPersistence:     0.55,
+  seed:                    0,
+  plateCount:              12,
+  continentalFraction:     0.45,
+  continentHeightFrac:     0.0006,
+  continentVariationFrac:  0.0002,
+  oceanFloorFrac:          0.0004,
+  oceanVariationFrac:      0.00015,
+  mountainHeightFrac:      0.0008,
+  trenchDepthFrac:         0.0008,
+  ridgeHeightFrac:         0.00025,
+  riftDepthFrac:           0.00025,
+  boundaryWidth:           0.04,
+  convergentThreshold:     0.15,
+  seamountHeightFrac:      0.0005,
+  seamountFrequency:       6.0,
+  seamountSharpness:       6.0,
+  terrainScale:            20.0,
+  terrainOctaves:          5,
+  terrainLacunarity:       2.95,
+  terrainGain:            -0.4,
+  terrainWarpStrength:     5.0,
+  fineDetailFrac:          0.00005,
 };
 
 const heightFnCache = new Map();
 function getHeightFn(noiseParams, radius) {
   const cacheKey = JSON.stringify(noiseParams) + `:${radius}`;
   if (!heightFnCache.has(cacheKey)) {
-    heightFnCache.set(cacheKey, buildCombinedHeightFn({ ...noiseParams, radius }));
+    heightFnCache.set(cacheKey, buildPlateHeightFn({ ...noiseParams, radius }));
   }
   return heightFnCache.get(cacheKey);
 }
